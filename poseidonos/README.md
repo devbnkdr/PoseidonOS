@@ -243,12 +243,11 @@ Bayer 8×8 ordered dithering), with a wasteland-map layer added on top. Fonts ar
 License. Weather data comes from [Open-Meteo](https://open-meteo.com) and ZIP code lookup from
 [Zippopotam.us](https://zippopotam.us).
 
-## No warranty
+## Disclaimer
 
-PoseidonOS is provided as is, without any warranty, and you use it at your own risk. It changes
-your desktop settings; the installer backs them up first and `uninstall.sh` restores them, but
-keep your own backups too. To the extent the law allows, the author is not liable for any damage
-or data loss resulting from its use. See sections 15 and 16 of the [license](../LICENSE) for the full terms.
+PoseidonOS is provided as is, without any warranty, and you use it at your own risk. Keep your own
+backups. The full [disclaimer](../README.md#disclaimer) and sections 15 and 16 of the
+[license](../LICENSE) have the details.
 
 ## License
 
