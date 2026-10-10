@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# poseidonos-theme  green | amber | blue | toggle   (toggle cycles green -> amber -> blue)
+# Switches every part of the PoseidonOS theme to one phosphor colour.
+#
+# Re-styling a whole Plasma session (colour scheme -> every KDE app, Aurorae
+# reload, KWin reconfigure, Konsole) is heavy.  When this is launched from a
+# widget it records the choice, hands the work off detached and niced, and
+# returns immediately, so plasmashell never blocks on it.  A lock keeps extra
+# clicks from stacking several full restyles on top of each other.
+set -u
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/poseidonos"
+LOG="${XDG_CACHE_HOME:-$HOME/.cache}/poseidonos-theme.log"
+LOCK="${XDG_RUNTIME_DIR:-/tmp}/poseidonos-theme.lock"
+mkdir -p "$CONF" "$(dirname "$LOG")"
+
+KW=$(command -v kwriteconfig6 || command -v kwriteconfig5)
+KR=$(command -v kreadconfig6 || command -v kreadconfig5 || true)
+dbus() { dbus-send --session --type=method_call "$@" >/dev/null 2>&1 || true; }
+
+resolve() {   # $1 = green|amber|blue|toggle  ->  sets want / V
+    local c; c=$(cat "$CONF/variant" 2>/dev/null || echo green)
+    want="$1"
+    [ "$want" = toggle ] && case "$c" in green) want=amber;; amber) want=blue;; *) want=green;; esac
+    case "$want" in
+        green) V=Green;; amber) V=Amber;; blue) V=Blue;;
+        *) echo "usage: poseidonos-theme green|amber|blue|toggle"; exit 2;;
+    esac
+}
+
+applied() {   # already fully wearing variant $V ?
+    [ -n "$KR" ] || return 1
+    [ "$("$KR" --file kwinrc --group org.kde.kdecoration2 --key theme 2>/dev/null)" = "__aurorae__svg__PoseidonOS-$V" ]
+}
+
+resolve "${1:-toggle}"
+
+# nothing to do if this phosphor is already on
+if [ "$(cat "$CONF/variant" 2>/dev/null || echo)" = "$want" ] && applied; then
+    echo "PoseidonOS: $want phosphor already engaged."
+    exit 0
+fi
+
+# record the choice straight away so the widgets can update without waiting
+echo "$want" > "$CONF/variant"
+
+# launched by a widget (no terminal attached): do the heavy part detached + niced
+if [ -z "${PN_THEME_CHILD:-}" ] && [ ! -t 1 ]; then
+    PN_THEME_CHILD=1 setsid nohup nice -n 5 "$0" "$want" </dev/null >>"$LOG" 2>&1 &
+    exit 0
+fi
+
+# one restyle at a time; wait briefly for a run already in flight, then take the
+# newest choice on record rather than repeating an older one
+exec 9>"$LOCK"
+flock -w 25 9 2>/dev/null || exit 0
+resolve "$(cat "$CONF/variant" 2>/dev/null || echo "$want")"
+applied && { echo "PoseidonOS: $want phosphor already engaged."; exit 0; }
+
+# note the overlay's state now; it is re-tinted at the very end, after the colours
+# are already on screen, so it never delays the visible part of the switch
+CRT=$(command -v poseidonos-crt || echo "$HOME/.local/bin/poseidonos-crt")
+crt_was=0
+[ -x "$CRT" ] && "$CRT" status 2>/dev/null | grep -q running && crt_was=1
+
+# colours (Plasma style, widgets, GTK via kde-gtk-config all follow this)
+timeout 40 plasma-apply-colorscheme "PoseidonOS$V" >/dev/null 2>&1 || true
+
+# window frames.  Only poke KWin when the decoration actually changes: every
+# reconfigure tears down and rebuilds the compositor's GL state, and on X11 that
+# is rough on other GL clients (Electron apps lose their context and can die).
+DECO="__aurorae__svg__PoseidonOS-$V"
+prev_deco=""
+[ -n "$KR" ] && prev_deco=$("$KR" --file kwinrc --group org.kde.kdecoration2 --key theme 2>/dev/null || true)
+$KW --file kwinrc --group org.kde.kdecoration2 --key library org.kde.kwin.aurorae
+$KW --file kwinrc --group org.kde.kdecoration2 --key theme "$DECO"
+if [ "$prev_deco" != "$DECO" ]; then
+    dbus --dest=org.kde.KWin /KWin org.kde.KWin.reconfigure
+else
+    echo "window decoration unchanged; skipping KWin reconfigure"
+fi
+
+# Konsole: default profile for new windows ...
+$KW --file konsolerc --group "Desktop Entry" --key DefaultProfile "PoseidonOS-$V.profile"
+
+# ... and switch every tab that is already open (Konsole's D-Bus API).
+# Skipped when no Konsole is running: enumerating the bus and poking 40 session
+# paths on a dead service is slow and can stall for seconds.
+if pgrep -u "$(id -u)" -x konsole >/dev/null 2>&1; then
+    QD=$(command -v qdbus6 || command -v qdbus || true)
+    if [ -n "$QD" ]; then
+        for svc in $(timeout 3 "$QD" 2>/dev/null | grep -oE 'org\.kde\.konsole-[0-9]+' | sort -u); do
+            for sp in $(timeout 3 "$QD" "$svc" 2>/dev/null | grep -E '^/Sessions/[0-9]+$'); do
+                timeout 3 "$QD" "$svc" "$sp" org.kde.konsole.Session.setProfile "PoseidonOS $V" >/dev/null 2>&1 || true
+            done
+        done
+    else
+        for svc in $(timeout 3 dbus-send --session --print-reply --dest=org.freedesktop.DBus / org.freedesktop.DBus.ListNames 2>/dev/null | grep -oE 'org\.kde\.konsole-[0-9]+' | sort -u); do
+            for n in $(seq 1 40); do
+                timeout 2 dbus-send --session --type=method_call --dest="$svc" "/Sessions/$n" org.kde.konsole.Session.setProfile string:"PoseidonOS $V" >/dev/null 2>&1 || true
+            done
+        done
+    fi
+fi
+
+# CRT overlay re-tinted, only if it was actually up before
+if [ "$crt_was" = 1 ] && [ -x "$CRT" ]; then
+    "$CRT" restart >/dev/null 2>&1
+fi
+
+echo "PoseidonOS: $want phosphor engaged."

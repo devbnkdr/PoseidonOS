@@ -1,0 +1,13 @@
+# Desktop snapshots made by poseidonos/backup-desktop.sh
+desktop-backup-*.tar.gz
+# Output of poseidonos/diagnose.sh
+diag.txt
+# Local reports and scratch files
+*.txt
+!poseidonos/fonts/OFL-*.txt
+_archive/
+__pycache__/
+*.py[cod]
+.directory
+# unedited screenshots (may show personal info) - only cleaned copies get committed
+screenshots-raw/

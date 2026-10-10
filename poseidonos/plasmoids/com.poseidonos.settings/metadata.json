@@ -1,0 +1,14 @@
+{
+  "KPackageStructure": "Plasma/Applet",
+  "KPlugin": {
+    "Id": "com.poseidonos.settings",
+    "Name": "PoseidonOS Settings",
+    "Description": "[ CFG ] popup: phosphor colour, CRT overlay, dither wallpaper and weather location",
+    "Icon": "configure",
+    "Category": "System Information",
+    "Authors": [{ "Name": "devbnkdr" }],
+    "License": "GPL-3.0-only",
+    "Version": "1.0.0"
+  },
+  "X-Plasma-API-Minimum-Version": "6.0"
+}

@@ -1,0 +1,389 @@
+#!/usr/bin/env bash
+# PoseidonOS - panel (bar) control
+#
+#   poseidonos-panels status                   what each bar is doing right now
+#   poseidonos-panels dodge  [bottom|top|all]  on screen until a window touches it, then
+#                                               slides away
+#   poseidonos-panels auto   [bottom|top|all]  hidden; reveals on an edge push
+#   poseidonos-panels below  [bottom|top|all]  CAREFUL: Plasma's "Windows Go Below"
+#                                               means the WINDOW goes below the BAR.
+#                                               The bar keeps drawing on top and hides
+#                                               whatever is under it.
+#   poseidonos-panels always [bottom|top|all]  always visible, reserves screen space
+#                                               - the taskbar default
+#   poseidonos-panels restore                  re-apply the saved choice (used at install)
+#   poseidonos-panels arrange                  put the bar in the PoseidonOS order: launcher,
+#                                               your apps, then TERMINAL [ CFG ] tray clock
+#                                               (show-desktop in the corner).
+#                                               Edits the saved order with the shell stopped -
+#                                               adding/removing widgets on a running bar can
+#                                               leave it undrawn.
+#   poseidonos-panels kick                     unstick a bar stuck on screen after a
+#                                               resolution / scale change (restarts the
+#                                               shell - the only thing that works on X11
+#                                               with mixed-resolution monitors)
+#   poseidonos-panels kick-soft                same, toggle only, no restart
+#
+# The target defaults to "all".  Whatever you pick is remembered in
+# ~/.config/poseidonos/panels so re-running install.sh does not put
+# the bar back in your way.  "top" is there for anyone who adds a top panel.
+#
+# Plasma calls these Dodge Windows, Auto Hide and Windows Go Below.  "always" is
+# the only one that reserves a strut - the other three all let a maximised window
+# use the whole screen, but only "dodge" and "auto" get the bar out of the way
+# instead of painting over the window.  True fullscreen windows cover every mode.
+#
+# Plasma 6 keeps the mode in plasmashellrc, [PlasmaViews][Panel <id>] panelVisibility
+# - NOT in the applets file next to the panel's widgets.
+
+set -uo pipefail
+C="${XDG_CONFIG_HOME:-$HOME/.config}/poseidonos"
+STORE="$C/panels"
+CFGDIR="${XDG_CONFIG_HOME:-$HOME/.config}"
+APPLETS="$CFGDIR/plasma-org.kde.plasma.desktop-appletsrc"
+SHELLRC="$CFGDIR/plasmashellrc"
+mkdir -p "$C"
+
+die() { printf 'poseidonos-panels: %s\n' "$*" >&2; exit 1; }
+
+store_get() {  # store_get top|bottom
+    local v
+    v=$(sed -n "s/^$1=//p" "$STORE" 2>/dev/null | tail -1)
+    # nothing saved: the taskbar stays put, a (user-added) top bar auto-hides
+    [ -n "$v" ] || { [ "$1" = bottom ] && v=always || v=auto; }
+    echo "$v"
+}
+store_set() {  # store_set <mode> <top|bottom|all>
+    local t b; t=$(store_get top); b=$(store_get bottom)
+    case "$2" in
+        all)    t=$1; b=$1;;
+        top)    t=$1;;
+        bottom) b=$1;;
+    esac
+    printf 'top=%s\nbottom=%s\n' "$t" "$b" > "$STORE"
+}
+
+# our names -> plasma scripting keyword -> panelVisibility int (fallback path)
+kw_for() { case "$1" in
+    auto)   echo autohide;;
+    below)  echo windowsgobelow;;
+    dodge)  echo dodgewindows;;
+    always) echo none;;
+    *) return 1;; esac; }
+int_for() { case "$1" in auto) echo 1;; dodge) echo 2;; below) echo 3;; always) echo 0;; esac; }
+name_for() { case "$1" in
+    autohide) echo auto;; windowsgobelow) echo below;;
+    dodgewindows|windowscancover) echo dodge;; none) echo always;; *) echo "$1";; esac; }
+
+shell_up() {
+    dbus-send --session --dest=org.kde.plasmashell /PlasmaShell \
+        org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1
+}
+wait_shell() {  # give a restarting shell a moment to answer
+    local i
+    for i in $(seq 1 "${1:-24}"); do
+        shell_up && return 0
+        sleep 0.5
+    done
+    return 1
+}
+set_live() { # set_live <plasma keyword> <top|bottom|all> -> prints "ok <n>"
+    js "var ps = panels(), n = 0; for (var i = 0; i < ps.length; i++) { var p = ps[i]; if ('$2' === 'all' || p.location === '$2') { p.hiding = '$1'; n++; } } print('ok ' + n);"
+}
+read_state() { # "top:autohide bottom:none"
+    js 'var ps = panels(), o = []; for (var i = 0; i < ps.length; i++) o.push(ps[i].location + ":" + ps[i].hiding); print(o.join(" "));'
+}
+js() { # run a plasma shell script, print whatever it print()ed
+    dbus-send --session --print-reply=literal --dest=org.kde.plasmashell \
+        /PlasmaShell org.kde.PlasmaShell.evaluateScript "string:$1" 2>/dev/null \
+        | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+# ------------------------------------------------- direct config fallback
+# Used only when plasmashell is not answering on D-Bus (e.g. called from
+# install.sh before the shell has come back up).
+config_panels() { # "<containment id> <edge> <panelVisibility>" for every panel on disk
+    command -v python3 >/dev/null || return 1
+    [ -f "$APPLETS" ] || return 1
+    python3 - "$APPLETS" "$SHELLRC" <<'PY'
+import re, sys
+LOC = {"3": "top", "4": "bottom", "5": "left", "6": "right"}
+def groups(path):
+    out, cur = {}, None
+    try: text = open(path).read()
+    except Exception: return out
+    for l in text.split("\n"):
+        if l.startswith("[") and l.rstrip().endswith("]"):
+            cur = l.strip(); out.setdefault(cur, {}); continue
+        if cur is not None and "=" in l:
+            k, v = l.split("=", 1); out[cur][k] = v
+    return out
+a, r = groups(sys.argv[1]), groups(sys.argv[2])
+for head, d in a.items():
+    m = re.match(r"^\[Containments\]\[(\d+)\]$", head)
+    if not m or d.get("plugin") != "org.kde.panel":
+        continue
+    n = m.group(1)
+    vis = r.get("[PlasmaViews][Panel %s]" % n, {}).get("panelVisibility", "0")
+    print(n, LOC.get(d.get("location"), "?"), vis)
+PY
+}
+present_edges() { # which edges actually have a panel right now (live shell first, then disk)
+    local r kv
+    r=$(read_state)
+    if [ -n "$r" ]; then
+        for kv in $r; do echo "${kv%%:*}"; done | sort -u
+    else
+        config_panels 2>/dev/null | awk '{ print $2 }' | sort -u
+    fi
+}
+write_config() { # write_config <mode> <target>
+    local v id loc rest n=0
+    v=$(int_for "$1")
+    command -v kwriteconfig6 >/dev/null || return 1
+    while read -r id loc rest; do
+        [ "$2" = all ] || [ "$loc" = "$2" ] || continue
+        kwriteconfig6 --file plasmashellrc --group PlasmaViews --group "Panel $id" \
+            --key panelVisibility "$v" && n=$((n + 1))
+    done < <(config_panels 2>/dev/null)
+    echo "config: $n panel(s)"
+    [ "$n" -gt 0 ]
+}
+
+# ------------------------------------------------- arrange the bar
+stop_shell() {
+    local i me; me=$(id -u)
+    systemctl --user stop plasma-plasmashell.service >/dev/null 2>&1
+    for i in $(seq 1 20); do pgrep -u "$me" -x plasmashell >/dev/null || return 0; sleep 0.3; done
+    kquitapp6 plasmashell >/dev/null 2>&1
+    for i in $(seq 1 30); do pgrep -u "$me" -x plasmashell >/dev/null || return 0; sleep 0.3; done
+    return 1
+}
+start_shell() {
+    systemctl --user start plasma-plasmashell.service >/dev/null 2>&1
+    sleep 1
+    pgrep -u "$(id -u)" -x plasmashell >/dev/null || (setsid plasmashell >/dev/null 2>&1 &)
+    wait_shell 40
+}
+# Reorders the PoseidonOS bar by rewriting its AppletOrder (ids and settings untouched).
+#   arrange_config <appletsrc> check -> exit 0 needs reordering, 1 already in order, 2 no bar
+#   arrange_config <appletsrc> apply -> rewrite the order
+arrange_config() {
+    python3 - "$1" "$2" <<'PY'
+import os, re, sys
+path, mode = sys.argv[1], sys.argv[2]
+OURS = {"com.poseidonos.tabs", "com.poseidonos.settings"}
+LEFT = ["org.kde.plasma.kickoff", "org.kde.plasma.kicker", "org.kde.plasma.kickerdash"]
+RIGHT = ["com.poseidonos.tabs", "com.poseidonos.settings", "org.kde.plasma.systemtray",
+         "org.kde.plasma.digitalclock", "org.kde.plasma.showdesktop"]
+pre, groups = [], []
+for l in open(path).read().split("\n"):
+    if l.startswith("[") and l.rstrip().endswith("]"):
+        groups.append([l.rstrip(), []])
+    elif groups:
+        groups[-1][1].append(l)
+    else:
+        pre.append(l)
+def kv(lines):
+    d = {}
+    for l in lines:
+        if "=" in l:
+            k, v = l.split("=", 1); d[k] = v
+    return d
+conts, applets = {}, {}
+for head, lines in groups:
+    m = re.match(r"^\[Containments\]\[(\d+)\]$", head)
+    if m:
+        conts[m.group(1)] = kv(lines); continue
+    m = re.match(r"^\[Containments\]\[(\d+)\]\[Applets\]\[(\d+)\]$", head)
+    if m:
+        applets.setdefault(m.group(1), {})[m.group(2)] = kv(lines).get("plugin", "")
+bars = [n for n, d in conts.items() if d.get("plugin") == "org.kde.panel" and d.get("location") == "4"
+        and OURS & set(applets.get(n, {}).values())]
+if not bars:
+    print("no PoseidonOS bar found")
+    sys.exit(2)
+changed = False
+for B in bars:
+    have = applets[B]
+    head = "[Containments][%s][General]" % B
+    gen = next((g for g in groups if g[0] == head), None)
+    saved = [i for i in kv(gen[1] if gen else []).get("AppletOrder", "").split(";") if i in have]
+    order = saved + sorted((i for i in have if i not in saved), key=int)
+    left = [i for i in order if have[i] in LEFT]
+    right = sorted((i for i in order if have[i] in RIGHT), key=lambda i: (RIGHT.index(have[i]), order.index(i)))
+    new = left + [i for i in order if i not in left and i not in right] + right
+    print("bar %s: %s" % (B, " ".join(have[i].split(".")[-1] for i in new)))
+    if new == saved:
+        continue
+    changed = True
+    if gen is None:
+        gen = [head, []]; groups.append(gen)
+    gen[1] = [l for l in gen[1] if not l.startswith("AppletOrder=")]
+    while gen[1] and gen[1][-1] == "":
+        gen[1].pop()
+    gen[1] += ["AppletOrder=" + ";".join(new), ""]
+if mode == "check":
+    sys.exit(0 if changed else 1)
+if changed:
+    open(path + ".arrange-tmp", "w").write("\n".join(pre + [x for h, ls in groups for x in [h] + ls]))
+    os.replace(path + ".arrange-tmp", path)
+PY
+}
+
+MODE="${1:-status}"
+TARGET="${2:-all}"
+case "$TARGET" in top|bottom|all) ;; *) die "target must be top, bottom or all";; esac
+
+case "$MODE" in
+    status)
+        shell_up || wait_shell 4 >/dev/null 2>&1
+        r=$(read_state)
+        if [ -z "$r" ]; then
+            echo "could not read the panels from plasmashell; falling back to the config files"
+            config_panels 2>/dev/null | while read -r id loc vis; do
+                case "$vis" in 0) m=always;; 1) m=auto;; 2) m=dodge;; 3) m=below;; *) m="?";; esac
+                printf '%-8s %s\n' "$loc" "$m"
+            done
+            printf '\nsaved:   top=%s bottom=%s\n' "$(store_get top)" "$(store_get bottom)"
+            exit 0
+        fi
+        for kv in $r; do
+            printf '%-8s %s\n' "${kv%%:*}" "$(name_for "${kv##*:}")"
+        done
+        printf '\nsaved:   top=%s bottom=%s\n' "$(store_get top)" "$(store_get bottom)"
+        ;;
+    kick|kick-soft)
+        # Plasma bugs 477810 / 478256: after a resolution or scale change an
+        # auto-hide or dodge panel gets stuck on screen and sits on top of
+        # maximised and fullscreen windows.  Bug 477810 lists two workarounds -
+        # toggle the visibility setting off and on, or restart the shell.  On
+        # X11 with mixed-resolution screens only the restart actually clears it
+        # (the toggle re-triggers the same stale-geometry path), so "kick" does
+        # that and "kick-soft" is the toggle-only version.
+        wait_shell 24 || die "plasmashell is not answering; nothing to kick"
+        hiding=0
+        for edge in $(present_edges); do
+            case "$edge" in top|bottom) ;; *) continue;; esac
+            m=$(store_get "$edge"); [ "$m" = always ] || hiding=1
+        done
+        if [ "$hiding" = 0 ]; then
+            echo "every bar is pinned (always) - nothing can get stuck, no restart needed"
+            exit 0
+        fi
+        for edge in $(present_edges); do
+            case "$edge" in top|bottom) ;; *) continue;; esac
+            m=$(store_get "$edge")
+            kw_for "$m" >/dev/null 2>&1 || m=auto
+            [ "$m" = always ] && continue        # a pinned bar cannot get stuck
+            kw=$(kw_for "$m")
+            if [ "$MODE" = kick-soft ]; then
+                set_live none "$edge" >/dev/null
+                sleep 0.3
+            fi
+            # re-assert into the LIVE shell, so its in-memory config is correct
+            # before it shuts down and writes that config back out
+            set_live "$kw" "$edge" >/dev/null
+        done
+        if [ "$MODE" = kick-soft ]; then
+            echo "toggled; if the bar is still stuck, run: poseidonos-panels kick"
+            exit 0
+        fi
+        sleep 1                                  # let the shell persist the modes
+        echo "restarting plasmashell to clear the stuck panel geometry..."
+        if systemctl --user restart plasma-plasmashell.service 2>/dev/null; then :
+        else
+            kquitapp6 plasmashell 2>/dev/null
+            sleep 1
+            (setsid plasmashell >/dev/null 2>&1 &)
+        fi
+        wait_shell 40 >/dev/null 2>&1 || true
+        sleep 1
+        state=$(read_state)
+        if [ -n "$state" ]; then
+            for kv in $state; do printf '%-8s %s\n' "${kv%%:*}" "$(name_for "${kv##*:}")"; done
+        else
+            echo "shell restarted; run 'poseidonos-panels status' in a moment to confirm"
+        fi
+        exit 0
+        ;;
+    restore)
+        # each edge gets its own remembered mode, but only edges that have a bar
+        wait_shell 24 >/dev/null 2>&1 || true
+        for edge in $(present_edges); do
+            case "$edge" in top|bottom) ;; *) continue;; esac
+            m=$(store_get "$edge")
+            kw_for "$m" >/dev/null 2>&1 || m=auto
+            "$0" "$m" "$edge"
+        done
+        exit 0
+        ;;
+    arrange)
+        command -v python3 >/dev/null || die "python3 is needed to arrange the bar"
+        arrange_config "$APPLETS" check >/dev/null 2>&1; rc=$?
+        case "$rc" in
+            1) echo "the bar is already in order"; exit 0;;
+            2) echo "no PoseidonOS bar found - nothing to arrange"; exit 0;;
+        esac
+        # plasmashell holds its own copy of the order and writes it back on exit,
+        # so the edit has to happen while it is stopped
+        was_up=0; shell_up && was_up=1
+        if [ "$was_up" = 1 ]; then
+            echo "stopping plasmashell to reorder the bar..."
+            stop_shell || die "could not stop plasmashell; nothing was changed"
+        fi
+        stamp=$(date +%Y%m%d-%H%M%S)
+        cp -a "$APPLETS" "$APPLETS.before-arrange-$stamp"
+        if arrange_config "$APPLETS" apply; then
+            echo "backup: $APPLETS.before-arrange-$stamp"
+        else
+            echo "arrange failed; your config was left as it was"
+        fi
+        if [ "$was_up" = 1 ]; then
+            echo "starting plasmashell..."
+            start_shell >/dev/null 2>&1 || echo "plasmashell is slow to come back; it will pick this up when it does"
+        fi
+        ;;
+    auto|below|dodge|always)
+        kw=$(kw_for "$MODE")
+        # Always go through the running shell when we can.  Editing the config
+        # behind a live plasmashell is not enough - it keeps its own copy in
+        # memory and writes it back out, so the change gets thrown away.
+        wait_shell 24 || true
+        set_live "$kw" "$TARGET" >/dev/null
+        # Verify by reading the panels back rather than trusting the return
+        # value: older shells print nothing at all, and an empty reply is not
+        # the same thing as "it did not work".
+        sleep 0.4
+        state=$(read_state)
+        r=""
+        if [ -n "$state" ]; then
+            n=0
+            for kv in $state; do
+                loc=${kv%%:*}; got=${kv##*:}
+                case "$TARGET" in all) ;; *) [ "$loc" = "$TARGET" ] || continue;; esac
+                [ "$got" = "$kw" ] && n=$((n + 1))
+            done
+            [ "$n" -gt 0 ] && r="ok $n"
+        fi
+        case "$r" in
+            "")
+                # shell down or not answering: write the config, then bounce the
+                # shell so it reads our version instead of overwriting it
+                if write_config "$MODE" "$TARGET" >/dev/null 2>&1; then
+                    echo "$MODE written to the panel config ($TARGET)"
+                    if shell_up; then
+                        echo "could not read the panels back to confirm; restart the shell to be sure:"
+                        echo "  systemctl --user restart plasma-plasmashell.service"
+                    else
+                        echo "(plasmashell is not running - it will load this on next start)"
+                    fi
+                else
+                    die "could not reach plasmashell and could not edit the panel config"
+                fi ;;
+            *) echo "$MODE: ${r#ok } panel(s) confirmed ($TARGET)" ;;
+        esac
+        store_set "$MODE" "$TARGET"
+        ;;
+    *) awk 'NR > 2 && /^# The target/ { exit } NR > 2 { sub(/^# ?/, ""); print }' "$0" ;;
+esac

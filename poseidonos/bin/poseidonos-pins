@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# PoseidonOS - make open apps land on their pinned taskbar button
+#
+#   poseidonos-pins          check: which open windows Plasma will NOT merge into
+#                             their pinned button, and why
+#   poseidonos-pins fix      fix those (run it while the app is open)
+#
+# Plasma puts a window on a pinned button only when it can trace the window back
+# to that button's exact .desktop file: the file's StartupWMClass (or its name)
+# has to match the window's WM_CLASS.  Apps run through Wine / Bottles / Lutris
+# (WM_CLASS "notepad++.exe", for instance) often have shortcuts with no
+# StartupWMClass, or are pinned from a copy of the shortcut on the Desktop that
+# Plasma never looks at - so you get the pin AND a second button for the window.
+#
+# fix does one of two things per stray window, and nothing when it is not sure:
+#   * pinned shortcut has no / the wrong StartupWMClass  -> set it (a shortcut of
+#     yours is edited in place, backed up first; a system one gets a personal
+#     override copy in ~/.local/share/applications)
+#   * pinned a different copy of the shortcut than the one Plasma matches the
+#     window to (e.g. a copy on ~/Desktop) -> repin the one Plasma matches
+# X11 only (it reads the window list with xprop).
+set -uo pipefail
+MODE="${1:-check}"
+case "$MODE" in check|fix) ;; *) sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0;; esac
+command -v python3 >/dev/null || { echo "python3 is needed"; exit 1; }
+command -v xprop   >/dev/null || { echo "xprop is needed: sudo pacman -S xorg-xprop"; exit 1; }
+
+js() { dbus-send --session --print-reply=literal --dest=org.kde.plasmashell /PlasmaShell \
+           org.kde.PlasmaShell.evaluateScript "string:$1" 2>/dev/null | sed 's/^[[:space:]]*//'; }
+# every task manager on every panel, with its pinned launchers, as JSON
+READ='var o = [], ps = panels();
+for (var i = 0; i < ps.length; i++) {
+    var ws = ps[i].widgets("org.kde.plasma.icontasks").concat(ps[i].widgets("org.kde.plasma.taskmanager"));
+    for (var j = 0; j < ws.length; j++) {
+        ws[j].currentConfigGroup = ["General"];
+        var l = ws[j].readConfig("launchers", []);
+        o.push({ widget: ws[j].id, launchers: (typeof l === "string") ? l.split(",") : Array.prototype.slice.call(l) });
+    }
+}
+print(JSON.stringify(o));'
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+js "$READ" > "$TMP/launchers.json"
+if ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$TMP/launchers.json" 2>/dev/null; then
+    echo "could not read your pinned apps from plasmashell (is it running?)"; exit 1
+fi
+
+python3 /dev/fd/3 "$MODE" "$TMP/launchers.json" "$TMP/actions" 3<<'PY'
+import json, os, re, shutil, subprocess, sys, time, urllib.parse
+
+mode, lpath, apath = sys.argv[1], sys.argv[2], sys.argv[3]
+HOME = os.path.expanduser("~")
+DATA_HOME = os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share")
+USER_APPS = os.path.join(DATA_HOME, "applications")
+BACKUPS = os.path.join(DATA_HOME, "poseidonos", "desktop-backups")
+
+# ---------------------------------------------------------------- .desktop index
+dirs = [USER_APPS, os.path.join(DATA_HOME, "flatpak/exports/share/applications")]
+for d in (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":"):
+    dirs.append(os.path.join(d, "applications"))
+dirs += ["/var/lib/flatpak/exports/share/applications", "/var/lib/snapd/desktop/applications"]
+
+def parse(path):
+    e, sect = {}, None
+    try:
+        for l in open(path, encoding="utf-8", errors="replace"):
+            l = l.rstrip("\n")
+            if l.startswith("["):
+                sect = l.strip(); continue
+            if sect == "[Desktop Entry]" and "=" in l and not l.startswith("#"):
+                k, v = l.split("=", 1)
+                if "[" not in k:
+                    e.setdefault(k.strip(), v.strip())
+    except OSError:
+        return None
+    return e
+
+index, seen_dirs = {}, set()         # desktop id -> {path, entry}; first dir wins (user overrides)
+for base in dirs:
+    base = os.path.realpath(base)
+    if base in seen_dirs or not os.path.isdir(base):
+        continue
+    seen_dirs.add(base)
+    for root, _, files in os.walk(base, followlinks=True):
+        for f in files:
+            if not f.endswith(".desktop"):
+                continue
+            p = os.path.join(root, f)
+            did = os.path.relpath(p, base).replace(os.sep, "-")
+            if did in index:
+                continue
+            e = parse(p)
+            if e is None or e.get("Type", "Application") != "Application" or e.get("Hidden") == "true":
+                continue
+            index[did] = {"path": p, "e": e, "id": did}
+
+def low(s): return (s or "").strip().lower()
+def stem_of(did): return low(did[:-8] if did.endswith(".desktop") else did)
+def exe_of(entry):
+    """program basename from Exec, skipping env / wrappers"""
+    ex = entry["e"].get("Exec", "")
+    toks = re.findall(r'"[^"]*"|\S+', ex)
+    toks = [t.strip('"') for t in toks]
+    skip = {"env", "flatpak", "run", "wine", "wine64", "bottles-cli", "lutris", "sh", "-c", "bash", "gamemoderun", "prime-run"}
+    for t in toks:
+        if "=" in t and not t.startswith("/"):
+            continue
+        b = os.path.basename(t.replace("\\\\", "/").replace("\\", "/"))
+        if b and b.lower() not in skip and not b.startswith("-") and not b.startswith("%"):
+            return re.sub(r"\.(exe|lnk|sh|appimage)$", "", b.lower())
+    return ""
+def words(s): return set(re.findall(r"[a-z0-9]+", low(s)))
+
+# ---------------------------------------------------------------- windows (X11)
+def xprop(*a):
+    try:
+        return subprocess.run(["xprop", *a], capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        return ""
+wins = []
+ids = re.findall(r"0x[0-9a-f]+", xprop("-root", "_NET_CLIENT_LIST").split("#")[-1])
+for wid in ids:
+    out = xprop("-id", wid, "WM_CLASS", "_NET_WM_PID", "_NET_WM_WINDOW_TYPE", "_NET_WM_STATE", "_NET_WM_NAME")
+    cls = re.findall(r'WM_CLASS\(STRING\) = "([^"]*)", "([^"]*)"', out)
+    if not cls:
+        continue
+    inst, klass = cls[0]
+    wtype = re.search(r"_NET_WM_WINDOW_TYPE\(ATOM\) = (\S+)", out)
+    wtype = wtype.group(1).rstrip(",") if wtype else "_NET_WM_WINDOW_TYPE_NORMAL"
+    if wtype not in ("_NET_WM_WINDOW_TYPE_NORMAL", "_NET_WM_WINDOW_TYPE_DIALOG"):
+        continue
+    state = re.search(r"_NET_WM_STATE\(ATOM\) = (.*)", out)
+    if state and "SKIP_TASKBAR" in state.group(1):
+        continue
+    if low(klass) in ("plasmashell", "krunner", "kwin", "kwin_x11"):
+        continue
+    pid = re.search(r"_NET_WM_PID\(CARDINAL\) = (\d+)", out)
+    pid = int(pid.group(1)) if pid else 0
+    title = re.search(r'_NET_WM_NAME\(UTF8_STRING\) = "(.*)"', out)
+    cmd = ""
+    if pid:
+        try:
+            cmd = open("/proc/%d/cmdline" % pid, "rb").read().split(b"\0")[0].decode(errors="replace")
+        except OSError:
+            pass
+    wins.append({"id": wid, "inst": inst, "cls": klass, "pid": pid, "title": title.group(1) if title else "",
+                 "prog": re.sub(r"\.(exe|bin)$", "", os.path.basename(cmd.replace("\\", "/")).lower())})
+
+def kde_service(w):
+    """roughly what Plasma's task manager matches a window to"""
+    keys = {low(w["cls"]), low(w["inst"])} - {""}
+    hits = [s for s in index.values() if low(s["e"].get("StartupWMClass")) in keys]
+    if hits:
+        hits.sort(key=lambda s: not any(s["id"].lower().startswith(k) for k in keys))
+        return hits[0], "StartupWMClass"
+    for s in index.values():
+        st = stem_of(s["id"])
+        if st in keys or st.split(".")[-1] in keys:
+            return s, "file name"
+    if w["prog"]:
+        for s in index.values():
+            if exe_of(s) and exe_of(s) == w["prog"]:
+                return s, "command line"
+    return None, ""
+
+# ---------------------------------------------------------------- pinned launchers
+def resolve(url):
+    if url.startswith("applications:"):
+        s = index.get(url[len("applications:"):])
+        return (s, s and s["path"]) if s else (None, None)
+    if url.startswith("file://"):
+        p = urllib.parse.unquote(url[len("file://"):])
+        for s in index.values():
+            if os.path.realpath(s["path"]) == os.path.realpath(p):
+                return s, p
+        e = parse(p)
+        return ({"path": p, "e": e, "id": os.path.basename(p), "loose": True} if e else None), p
+    return None, None
+
+tm = json.load(open(lpath))
+pins = []
+for t in tm:
+    for url in t["launchers"]:
+        url = url.strip()
+        if not url or url.startswith("preferred:"):
+            continue
+        s, p = resolve(url)
+        pins.append({"widget": t["widget"], "url": url, "s": s, "path": p,
+                     "name": (s["e"].get("Name") if s else None) or os.path.basename(url)})
+
+# ---------------------------------------------------------------- compare
+for w in wins:
+    w["svc"], w["how"] = kde_service(w)
+def same(pin, w):
+    return pin["s"] and w["svc"] and not pin["s"].get("loose") and \
+        os.path.realpath(pin["s"]["path"]) == os.path.realpath(w["svc"]["path"])
+for w in wins:
+    w["pin"] = next((p for p in pins if same(p, w)), None)
+open_pins = {id(w["pin"]) for w in wins if w["pin"]}
+
+def looks_like(pin, w):
+    if not pin["s"]:
+        return False
+    keys = {re.sub(r"\.(exe|bin)$", "", low(k)) for k in (w["cls"], w["inst"])} - {""}
+    keys |= {w["prog"]} - {""}
+    e = pin["s"]["e"]
+    return bool(keys & (words(e.get("Name")) | {exe_of(pin["s"]), stem_of(pin["s"]["id"]), low(e.get("StartupWMClass"))}))
+
+actions, lines = [], []
+for w in wins:
+    if w["pin"]:
+        continue
+    cands = [p for p in pins if id(p) not in open_pins and looks_like(p, w)]
+    label = "%s (WM_CLASS %s)" % (w["title"][:40] or w["cls"], w["cls"])
+    if len(cands) != 1:
+        if cands:
+            lines.append("?  %s could belong to several pins (%s) - left alone" % (label, ", ".join(p["name"] for p in cands)))
+        continue
+    pin = cands[0]
+    elsewhere = w["svc"] and (pin["s"].get("loose") or
+                              os.path.realpath(pin["s"]["path"]) != os.path.realpath(w["svc"]["path"]))
+    if elsewhere:
+        # Plasma knows this window as another shortcut: pin that one instead
+        actions.append({"kind": "repin", "widget": pin["widget"], "old": pin["url"],
+                        "new": "applications:" + w["svc"]["id"]})
+        lines.append("x  %s is shown as '%s' (%s), but the pin is %s -> repin %s" % (
+            label, w["svc"]["e"].get("Name"), w["svc"]["id"], pin["url"], "applications:" + w["svc"]["id"]))
+    else:
+        actions.append({"kind": "wmclass", "widget": pin["widget"], "url": pin["url"],
+                        "path": pin["path"], "id": pin["s"]["id"], "loose": bool(pin["s"].get("loose")),
+                        "cls": w["cls"]})
+        lines.append("x  %s does not match its pin '%s' -> StartupWMClass=%s" % (label, pin["name"], w["cls"]))
+
+print("open windows: %d   pinned apps: %d" % (len(wins), len(pins)))
+for w in wins:
+    if w["pin"]:
+        print("ok %s -> pin '%s'" % (w["title"][:40] or w["cls"], w["pin"]["name"]))
+for l in lines:
+    print(l)
+if not actions:
+    print("nothing to fix" + ("" if lines else " - every open app that has a pin is on its pin"))
+    sys.exit(0)
+if mode != "fix":
+    print("\nrun 'poseidonos-pins fix' to apply")
+    sys.exit(0)
+
+# ---------------------------------------------------------------- fix
+os.makedirs(BACKUPS, exist_ok=True)
+os.makedirs(USER_APPS, exist_ok=True)
+stamp = time.strftime("%Y%m%d-%H%M%S")
+def set_wmclass(text, cls):
+    out, done, in_main = [], False, False
+    for l in text.split("\n"):
+        if l.startswith("["):
+            if in_main and not done:
+                out.insert(len(out) - (1 if out and out[-1] == "" else 0), "StartupWMClass=" + cls); done = True
+            in_main = l.strip() == "[Desktop Entry]"
+        elif in_main and l.startswith("StartupWMClass="):
+            if not done:
+                out.append("StartupWMClass=" + cls); done = True
+            continue
+        out.append(l)
+    if not done:
+        out.append("StartupWMClass=" + cls)
+    return "\n".join(out)
+
+repins = []
+for a in actions:
+    if a["kind"] == "repin":
+        repins.append(a); continue
+    src = a["path"]
+    text = open(src, encoding="utf-8", errors="replace").read()
+    if a["loose"]:
+        # a shortcut outside the menu (e.g. on the Desktop): Plasma never indexes those,
+        # so put a copy in the menu and pin that
+        did = "poseidonos-" + re.sub(r"[^A-Za-z0-9._-]+", "-", os.path.basename(src))
+        dst = os.path.join(USER_APPS, did)
+        open(dst, "w").write(set_wmclass(text, a["cls"]))
+        repins.append({"widget": a["widget"], "old": a["url"], "new": "applications:" + did})
+        print("fixed: copied %s into the menu as %s with StartupWMClass=%s" % (src, did, a["cls"]))
+    elif os.path.realpath(src).startswith(os.path.realpath(USER_APPS) + os.sep):
+        shutil.copy2(src, os.path.join(BACKUPS, a["id"] + "." + stamp))
+        open(src, "w").write(set_wmclass(text, a["cls"]))
+        print("fixed: %s now has StartupWMClass=%s (backup in %s)" % (src, a["cls"], BACKUPS))
+    else:
+        dst = os.path.join(USER_APPS, a["id"])
+        open(dst, "w").write(set_wmclass(text, a["cls"]))
+        print("fixed: personal copy of %s at %s with StartupWMClass=%s" % (a["id"], dst, a["cls"]))
+json.dump(repins, open(apath, "w"))
+PY
+rc=$?
+[ "$MODE" = fix ] || exit $rc
+# rebuild KDE's app index so the edited shortcuts count straight away
+kbuildsycoca6 >/dev/null 2>&1 || kbuildsycoca5 >/dev/null 2>&1 || true
+if [ -s "$TMP/actions" ] && [ "$(cat "$TMP/actions")" != "[]" ]; then
+    # swap pins: a settings change on the task manager only - no widgets added or removed
+    R=$(cat "$TMP/actions")
+    js "var R = $R, ps = panels(), n = 0;
+for (var i = 0; i < ps.length; i++) {
+    var ws = ps[i].widgets(\"org.kde.plasma.icontasks\").concat(ps[i].widgets(\"org.kde.plasma.taskmanager\"));
+    for (var j = 0; j < ws.length; j++) {
+        ws[j].currentConfigGroup = [\"General\"];
+        var l = ws[j].readConfig(\"launchers\", []);
+        l = (typeof l === \"string\") ? l.split(\",\") : Array.prototype.slice.call(l);
+        var changed = false;
+        for (var k = 0; k < R.length; k++) {
+            if (R[k].widget !== ws[j].id) continue;
+            var at = l.indexOf(R[k].old);
+            if (at >= 0) { l[at] = R[k].new; changed = true; n++; }
+        }
+        if (changed) { ws[j].writeConfig(\"launchers\", l); ws[j].reloadConfig(); }
+    }
+}
+print(\"repinned \" + n);"
+fi
+echo "done - if a window still sits on its own button, close the app and open it again"

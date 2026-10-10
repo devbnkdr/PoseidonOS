@@ -1,0 +1,14 @@
+{
+  "KPackageStructure": "Plasma/Applet",
+  "KPlugin": {
+    "Id": "com.poseidonos.hud",
+    "Name": "PoseidonOS HUD",
+    "Description": "Terminal-style desktop readouts: weather, CPU, GPU, memory, disks, processes and program shortcuts",
+    "Icon": "utilities-system-monitor",
+    "Category": "System Information",
+    "Authors": [{ "Name": "devbnkdr" }],
+    "License": "GPL-3.0-only",
+    "Version": "1.0.0"
+  },
+  "X-Plasma-API-Minimum-Version": "6.0"
+}

@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+# poseidonos-stats <command>   (sys, procs, info, profile, allapps, ... - see the case below)
+# Prints one line of JSON for the PoseidonOS desktop HUD.
+export LC_ALL=C
+USER=${USER:-$(id -un 2>/dev/null)}
+esc() { local s=${1//\\/}; s=${s//\"/}; printf '%s' "${s//$'\t'/ }"; }
+
+# ---- runtime cache (tmpfs); everything below avoids spawning programs where bash can do it
+RUN="${XDG_RUNTIME_DIR:-/tmp}/poseidonos-stats"
+[ -d "$RUN" ] || mkdir -p "$RUN"
+numv() { local _v=${2//[[:space:]]/}; [[ "$_v" =~ ^[0-9.]+$ ]] || _v=null; printf -v "$1" '%s' "$_v"; }
+
+# NVIDIA: one long-running `nvidia-smi -l 2` instead of launching it every 2 s (each
+# launch re-initialises the driver and costs far more than the query). It exits on its
+# own ~30-60 s after the HUD stops asking (e.g. while windows cover the desktop).
+gpu_nvidia() {
+    local f="$RUN/gpu.csv" pid="" comm="" line=""
+    : > "$RUN/gpu.want"
+    [ -r "$RUN/gpu.pid" ] && read -r pid < "$RUN/gpu.pid"
+    [ -n "$pid" ] && [ -r "/proc/$pid/comm" ] && read -r comm < "/proc/$pid/comm"
+    if [ "$comm" != "bash" ]; then
+        setsid bash -c '
+            R=$1; echo $$ > "$R/gpu.pid"; : > "$R/gpu.mark"; n=0
+            nvidia-smi -i 0 --query-gpu=name,utilization.gpu,temperature.gpu,memory.used,memory.total,power.draw,fan.speed \
+                       --format=csv,noheader,nounits -l 2 2>/dev/null |
+            while IFS= read -r l; do
+                printf "%s\n" "$l" > "$R/gpu.csv"
+                if (( ++n % 15 == 0 )); then [[ "$R/gpu.want" -nt "$R/gpu.mark" ]] || break; : > "$R/gpu.mark"; fi
+            done
+            rm -f "$R/gpu.pid"' _ "$RUN" </dev/null >/dev/null 2>&1 &
+    fi
+    [ -r "$f" ] && read -r line < "$f"
+    [ -n "$line" ] || return 1
+    local gn gu gt gmu gmt gp gf
+    IFS=',' read -r gn gu gt gmu gmt gp gf <<<"$line"
+    gn=${gn#"${gn%%[![:space:]]*}"}; gn=${gn#NVIDIA GeForce }; gn=${gn//\"/}; gn=${gn//\\/}
+    numv gu "$gu"; numv gt "$gt"; numv gmu "$gmu"; numv gmt "$gmt"; numv gp "$gp"; numv gf "$gf"
+    gpu="{\"name\":\"$gn\",\"util\":$gu,\"temp\":$gt,\"memUsed\":$gmu,\"memTotal\":$gmt,\"power\":$gp,\"fan\":$gf}"
+}
+
+sys() {
+    local now; printf -v now '%(%s)T' -1
+    # CPU raw counters (the HUD diffs two samples)
+    read -r _ u n s i w q sq st _ < /proc/stat
+    local cpu_total=$((u+n+s+i+w+q+sq+st)) cpu_idle=$((i+w))
+
+    # static facts (CPU model, core count, sensor paths) are found once and cached
+    local cores cpu_model tempf amdh
+    if [ -r "$RUN/static" ]; then
+        { IFS= read -r cores; IFS= read -r cpu_model; IFS= read -r tempf; IFS= read -r amdh; } < "$RUN/static"
+    else
+        cpu_model=$(awk -F': ' '/model name/{print $2; exit}' /proc/cpuinfo); cpu_model=${cpu_model//\"/}; cpu_model=${cpu_model//\\/}
+        cores=$(nproc 2>/dev/null || echo 0)
+        tempf=""; amdh=""
+        local h name f lbl
+        for h in /sys/class/hwmon/hwmon*; do
+            name=""; [ -r "$h/name" ] && read -r name < "$h/name"
+            case "$name" in
+                k10temp|zenpower)
+                    [ -n "$tempf" ] && continue
+                    for f in "$h"/temp*_label; do lbl=""; [ -r "$f" ] && read -r lbl < "$f"
+                        [[ "$lbl" == Tctl || "$lbl" == Tdie ]] && { tempf="${f%_label}_input"; break; }
+                    done
+                    [ -z "$tempf" ] && [ -f "$h/temp1_input" ] && tempf="$h/temp1_input" ;;
+                coretemp)
+                    [ -n "$tempf" ] && continue
+                    for f in "$h"/temp*_label; do lbl=""; [ -r "$f" ] && read -r lbl < "$f"
+                        [[ "$lbl" == Package* ]] && { tempf="${f%_label}_input"; break; }
+                    done ;;
+                amdgpu) [ -z "$amdh" ] && amdh="$h" ;;
+            esac
+        done
+        printf '%s\n' "$cores" "$cpu_model" "$tempf" "$amdh" > "$RUN/static"
+    fi
+    local ctemp=null v
+    if [ -n "$tempf" ] && read -r v < "$tempf" 2>/dev/null; then ctemp=$(( v / 1000 )); fi
+
+    # Memory (kB)
+    local mt=0 ma=0 stt=0 sf=0 k val
+    while read -r k val _; do
+        case "$k" in MemTotal:) mt=$val;; MemAvailable:) ma=$val;; SwapTotal:) stt=$val;; SwapFree:) sf=$val; break;; esac
+    done < /proc/meminfo
+
+    # GPU: NVIDIA via the long-running query, else amdgpu hwmon
+    local gpu=null
+    if command -v nvidia-smi >/dev/null 2>&1; then gpu_nvidia || gpu=null; fi
+    if [ "$gpu" = null ] && [ -n "$amdh" ]; then
+        local gu2=null gt2=null
+        [ -r "$amdh/device/gpu_busy_percent" ] && read -r gu2 < "$amdh/device/gpu_busy_percent"
+        [ -r "$amdh/temp1_input" ] && read -r v < "$amdh/temp1_input" && gt2=$(( v / 1000 ))
+        gpu="{\"name\":\"AMD GPU\",\"util\":${gu2:-null},\"temp\":$gt2,\"memUsed\":null,\"memTotal\":null,\"power\":null,\"fan\":null}"
+    fi
+
+    # Filesystems: usage changes slowly, so `df` runs at most every 30 s
+    local fs="" ts=0
+    [ -r "$RUN/fs" ] && { read -r ts; IFS= read -r fs; } < "$RUN/fs"
+    if (( now - ${ts:-0} > 30 )); then
+        fs=$(df -B1 --output=source,fstype,size,used,target 2>/dev/null | awk '
+            NR>1 && $1 ~ /^\/dev\// && $2 !~ /^(squashfs|iso9660|udf)$/ && !seen[$1]++ {
+                if ($2 == "vfat" && $3 < 4294967296) next;
+                t=$5; for (i=6;i<=NF;i++) t=t" "$i; gsub(/"/,"",t);
+                printf "%s{\"mount\":\"%s\",\"dev\":\"%s\",\"size\":%s,\"used\":%s}", (n++?",":""), t, $1, $3, $4 }')
+        printf '%s\n%s\n' "$now" "$fs" > "$RUN/fs"
+    fi
+
+    # Disk activity raw counters for whole disks
+    local io="" dn rd wr busy
+    while read -r _ _ dn _ _ rd _ _ _ wr _ _ busy _; do
+        [[ "$dn" =~ ^(nvme[0-9]+n[0-9]+|sd[a-z]+|vd[a-z]+|hd[a-z]+|mmcblk[0-9]+)$ ]] || continue
+        io+="${io:+,}{\"name\":\"$dn\",\"rd\":$rd,\"wr\":$wr,\"busy\":$busy}"
+    done < /proc/diskstats
+
+    # Network: default-route interface counters (address looked up at most once a minute)
+    local nif="" nrx=0 ntx=0 nip="" ifc dst mask a b
+    while read -r ifc dst _ _ _ _ _ mask _; do
+        [ "$dst" = 00000000 ] && [ "$mask" = 00000000 ] && { nif=$ifc; break; }
+    done < /proc/net/route
+    if [ -n "$nif" ]; then
+        while IFS=': ' read -r ifc a _ _ _ _ _ _ _ b _; do
+            [ "$ifc" = "$nif" ] && { nrx=$a; ntx=$b; break; }
+        done < /proc/net/dev
+        local its=0 iif=""
+        [ -r "$RUN/ip" ] && read -r its iif nip < "$RUN/ip"
+        if [ "$iif" != "$nif" ] || (( now - ${its:-0} > 60 )); then
+            nip=$(ip -4 -o addr show dev "$nif" 2>/dev/null | awk '{print $4; exit}')
+            printf '%s %s %s\n' "$now" "$nif" "$nip" > "$RUN/ip"
+        fi
+    fi
+    local up l1 l2 l3 t
+    read -r up _ < /proc/uptime
+    read -r l1 l2 l3 _ < /proc/loadavg
+    t=${EPOCHREALTIME:-}; if [ -n "$t" ]; then t=${t:0:14}; else t=$(date +%s.%N | cut -c1-14); fi
+    printf '{"t":%s,"cpu":{"total":%s,"idle":%s,"temp":%s,"model":"%s","cores":%s},"mem":{"total":%s,"avail":%s,"swapTotal":%s,"swapFree":%s},"gpu":%s,"fs":[%s],"io":[%s],"net":{"if":"%s","ip":"%s","rx":%s,"tx":%s},"load":"%s","uptime":%s}\n' \
+        "$t" "$cpu_total" "$cpu_idle" "$ctemp" "$cpu_model" "$cores" \
+        "$mt" "$ma" "${stt:-0}" "${sf:-0}" "$gpu" "$fs" "$io" "$nif" "$nip" "${nrx:-0}" "${ntx:-0}" "$l1 $l2 $l3" "$up"
+}
+
+procs() {
+    # second iteration of top = real instantaneous %CPU
+    top -b -n 2 -d 0.6 -o %CPU -w 512 2>/dev/null | awk '
+        /^top -/ { it++ ; next }
+        it == 2 && /^ *PID/ { hdr = 1; next }
+        it == 2 && hdr && NF >= 12 && n < 10 {
+            cmd = $12; for (i = 13; i <= NF; i++) cmd = cmd " " $i
+            gsub(/["\\]/, "", cmd)
+            printf "%s{\"pid\":%s,\"cpu\":%s,\"mem\":%s,\"cmd\":\"%s\"}", (n++ ? "," : "["), $1, $9, $10, cmd }
+        END { if (n) print "]"; else print "[]" }'
+}
+
+case "${1:-sys}" in
+    sys) sys ;;
+    procs) procs ;;
+    launchers) # pinned launchers of the panel task manager (PINNED tab)
+        grep -h '^launchers=' "$HOME/.config/plasma-org.kde.plasma.desktop-appletsrc" 2>/dev/null | awk '{ print length, $0 }' | sort -rn | head -1 | cut -d' ' -f2- | sed 's/^launchers=//' ;;
+    settings) # current state for the [ CFG ] popup
+        C="${XDG_CONFIG_HOME:-$HOME/.config}/poseidonos"
+        SCANLINES=0.14; VIGNETTE=0.55; ROLL=1; FLICKER=1
+        [ -f "$C/crt.conf" ] && . "$C/crt.conf"
+        run=false; "$HOME/.local/bin/poseidonos-crt" status 2>/dev/null | grep -q running && run=true
+        d=$(cat "$C/desktop.json" 2>/dev/null); [ -n "$d" ] || d='{}'
+        printf '{"variant":"%s","crt":{"running":%s,"scanlines":%s,"vignette":%s,"roll":%s,"flicker":%s},"desktop":%s}\n' \
+            "$(cat "$C/variant" 2>/dev/null || echo green)" "$run" "$SCANLINES" "$VIGNETTE" "$ROLL" "$FLICKER" "$d" ;;
+    info) # slow-changing system facts (called every minute)
+        CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/poseidonos-updates"
+        pk=null; upd=null
+        command -v pacman >/dev/null && pk=$(pacman -Qq 2>/dev/null | wc -l)
+        if command -v checkupdates >/dev/null; then
+            if [ ! -f "$CACHE" ] || [ $(( $(date +%s) - $(stat -c %Y "$CACHE") )) -gt 1800 ]; then
+                (timeout 60 checkupdates 2>/dev/null | wc -l > "$CACHE.tmp" && mv "$CACHE.tmp" "$CACHE") &
+            fi
+            [ -f "$CACHE" ] && upd=$(cat "$CACHE")
+        fi
+        ping=$(ping -c1 -W1 1.1.1.1 2>/dev/null | awk -F'time=' '/time=/{split($2,a," "); print a[1]; exit}')
+        os=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Linux}")
+        # plasmashell --version starts a Qt process: cache it (it only changes on upgrade) and
+        # give it a UTF-8 locale, otherwise Qt logs "Detected locale C" every minute
+        PV="${XDG_CACHE_HOME:-$HOME/.cache}/poseidonos-plasma-version"
+        if [ ! -s "$PV" ] || [ "$(command -v plasmashell)" -nt "$PV" ]; then
+            LC_ALL=C.UTF-8 plasmashell --version 2>/dev/null | awk '{print $2}' > "$PV"
+        fi
+        pv=$(cat "$PV" 2>/dev/null)
+        printf '{"host":"%s","user":"%s","kernel":"%s","os":"%s","plasma":"%s","session":"%s","pkgs":%s,"updates":%s,"ping":%s,"shell":"%s"}\n' \
+            "$(esc "$(hostname 2>/dev/null || cat /etc/hostname)")" "$(esc "$USER")" "$(uname -r)" "$(esc "$os")" "$pv" \
+            "${XDG_SESSION_TYPE:-?}" "${pk:-null}" "${upd:-null}" "${ping:-null}" "$(basename "${SHELL:-bash}")" ;;
+    media) # now playing via playerctl
+        command -v playerctl >/dev/null || { echo '{"missing":true}'; exit 0; }
+        line=""
+        while IFS= read -r l; do
+            [ -z "$line" ] && line="$l"
+            [[ "$l" == *"|Playing|"* ]] && { line="$l"; break; }
+        done < <(playerctl -a metadata --format '{{playerName}}|{{status}}|{{artist}}|{{title}}|{{position}}|{{mpris:length}}' 2>/dev/null)
+        [ -n "$line" ] || { echo '{"none":true}'; exit 0; }
+        IFS='|' read -r pn st ar ti po le <<<"$line"
+        printf '{"player":"%s","status":"%s","artist":"%s","title":"%s","pos":%s,"len":%s}\n' \
+            "$(esc "$pn")" "$st" "$(esc "$ar")" "$(esc "$ti")" "${po:-0}" "${le:-0}" ;;
+    media-ctl) command -v playerctl >/dev/null && playerctl "${2:-play-pause}" >/dev/null 2>&1 ;;
+    exec) # built-in console: exec <b64 cwd> <b64 command>
+        cwd=$(printf '%s' "$2" | base64 -d); cmd=$(printf '%s' "$3" | base64 -d)
+        timeout 30 bash -c 'cd -- "$1" 2>/dev/null || cd; eval "$2"; rc=$?; echo; echo "__PNCWD__$PWD"; echo "__PNRC__$rc"' _ "$cwd" "$cmd" </dev/null 2>&1 | tail -c 60000
+        ;;
+    profile) # WELCOME card + quick toggles
+        C="${XDG_CONFIG_HOME:-$HOME/.config}/poseidonos"
+        nm=$(getent passwd "$USER" 2>/dev/null | cut -d: -f5 | cut -d, -f1); [ -n "$nm" ] || nm="$USER"
+        face=""; for f in "$HOME/.face.icon" "$HOME/.face" "/var/lib/AccountsService/icons/$USER"; do [ -r "$f" ] && { face="$f"; break; }; done
+        net=""; ntype=""
+        if command -v nmcli >/dev/null; then
+            IFS=: read -r net ntype < <(nmcli -t -f NAME,TYPE connection show --active 2>/dev/null | grep -v ':loopback$' | head -n1)
+        fi
+        bt=null
+        command -v bluetoothctl >/dev/null && bt=$(timeout 2 bluetoothctl show 2>/dev/null | awk '/Powered:/{print ($2=="yes")?"true":"false"; exit}')
+        vol=null; muted=false
+        if command -v wpctl >/dev/null; then
+            v=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null)
+            vol=$(awk '{print int($2*100+0.5)}' <<<"$v"); [[ "$v" == *MUTED* ]] && muted=true
+        elif command -v pactl >/dev/null; then
+            vol=$(pactl get-sink-volume @DEFAULT_SINK@ 2>/dev/null | grep -o '[0-9]*%' | head -1 | tr -d %)
+            pactl get-sink-mute @DEFAULT_SINK@ 2>/dev/null | grep -q yes && muted=true
+        fi
+        run=false; "$HOME/.local/bin/poseidonos-crt" status 2>/dev/null | grep -q running && run=true
+        printf '{"name":"%s","user":"%s","home":"%s","host":"%s","face":"%s","net":"%s","netType":"%s","bt":%s,"vol":%s,"muted":%s,"variant":"%s","crt":%s}\n' \
+            "$(esc "$nm")" "$(esc "$USER")" "$(esc "$HOME")" "$(esc "$(hostname 2>/dev/null || cat /etc/hostname)")" "$(esc "$face")" \
+            "$(esc "$net")" "$(esc "$ntype")" "${bt:-null}" "${vol:-null}" "$muted" \
+            "$(cat "$C/variant" 2>/dev/null || echo green)" "$run" ;;
+    ctl) # quick-toggle actions
+        ds() { dbus-send --session --type=method_call "$@" >/dev/null 2>&1; }
+        case "$2" in
+            bt)        if timeout 2 bluetoothctl show 2>/dev/null | grep -q 'Powered: yes'; then bluetoothctl power off; else bluetoothctl power on; fi >/dev/null 2>&1 ;;
+            vol)       n=${3:-50}; if command -v wpctl >/dev/null; then wpctl set-volume @DEFAULT_AUDIO_SINK@ "$n%"; else pactl set-sink-volume @DEFAULT_SINK@ "$n%"; fi ;;
+            mute)      if command -v wpctl >/dev/null; then wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle; else pactl set-sink-mute @DEFAULT_SINK@ toggle; fi ;;
+            nightlight) ds --dest=org.kde.kglobalaccel /component/kwin org.kde.kglobalaccel.Component.invokeShortcut string:"Toggle Night Color" ;;
+            lock)      loginctl lock-session || ds --dest=org.freedesktop.ScreenSaver /ScreenSaver org.freedesktop.ScreenSaver.Lock ;;
+            power)     ds --dest=org.kde.LogoutPrompt /LogoutPrompt org.kde.LogoutPrompt.promptAll || ds --dest=org.kde.ksmserver /KSMServer org.kde.KSMServerInterface.logout int32:1 int32:0 int32:0 ;;
+            network)   setsid systemsettings kcm_networkmanagement >/dev/null 2>&1 & ;;
+            bluetooth-settings) setsid systemsettings kcm_bluetooth >/dev/null 2>&1 & ;;
+            profile)   setsid systemsettings kcm_users >/dev/null 2>&1 & ;;
+            phosphor)  "$HOME/.local/bin/poseidonos-theme" toggle >/dev/null 2>&1 ;;
+            crt)       "$HOME/.local/bin/poseidonos-crt" toggle >/dev/null 2>&1 ;;
+        esac ;;
+    allapps) # every launchable application, de-duplicated (user entries override system ones)
+        dirs=("$HOME/.local/share/applications" "$HOME/.local/share/flatpak/exports/share/applications"
+              /var/lib/flatpak/exports/share/applications /var/lib/snapd/desktop/applications
+              /usr/local/share/applications /usr/share/applications)
+        files=()
+        for d in "${dirs[@]}"; do [ -d "$d" ] && while IFS= read -r f; do files+=("$f"); done < <(find -L "$d" -name '*.desktop' 2>/dev/null); done
+        # shortcuts sitting on the desktop
+        [ -d "$HOME/Desktop" ] && while IFS= read -r f; do files+=("$f"); done < <(find "$HOME/Desktop" -maxdepth 1 -name '*.desktop' 2>/dev/null)
+        # AppImages that were never "installed" (no .desktop file)
+        appimg=""
+        for d in "$HOME/Applications" "$HOME/AppImages" "$HOME/.local/bin" "$HOME/apps" "/opt"; do
+            [ -d "$d" ] || continue
+            while IFS= read -r f; do
+                b=$(basename "$f"); n=${b%.[Aa]pp[Ii]mage}; n=$(sed -E 's/[-_ ]?(v?[0-9]+([._][0-9]+)*.*|x86_64|amd64|linux)$//I' <<<"$n"); n=${n//[-_]/ }
+                grep -rqsF "$f" "$HOME/.local/share/applications" 2>/dev/null && continue
+                appimg+="${appimg:+,}{\"id\":\"$(esc "$b")\",\"file\":\"$(esc "$f")\",\"name\":\"$(esc "$n")\",\"icon\":\"application-x-executable\",\"cats\":\"\",\"generic\":\"AppImage\",\"exec\":\"$(esc "$b")\"}"
+            done < <(find "$d" -maxdepth 2 -iname '*.appimage' -type f 2>/dev/null)
+        done
+        [ ${#files[@]} -gt 0 ] || { echo "[$appimg]"; exit 0; }
+        awk '
+            function flush() {
+                if (file != "" && type == "Application" && nodisplay != "true" && hidden != "true" && name != "" && !(id in seen) \
+                    && (onlyshow == "" || onlyshow ~ /(KDE|X-KDE)/) && notshow !~ /KDE/) {
+                    seen[id] = 1
+                    gsub(/["\\]/, "", name); gsub(/["\\]/, "", icon); gsub(/["\\]/, "", gen); gsub(/["\\]/, "", file); gsub(/["\\]/, "", ex); ex = substr(ex, 1, 160)
+                    printf "%s{\"id\":\"%s\",\"file\":\"%s\",\"name\":\"%s\",\"icon\":\"%s\",\"cats\":\"%s\",\"generic\":\"%s\",\"exec\":\"%s\"}", (n++ ? "," : "["), id, file, name, icon, cats, gen, ex
+                }
+            }
+            FNR == 1 {
+                flush()
+                file = FILENAME; id = FILENAME; sub(/.*\//, "", id)
+                inentry = 0; type = ""; name = ""; icon = ""; cats = ""; gen = ""; nodisplay = ""; hidden = ""; onlyshow = ""; notshow = ""; ex = ""
+            }
+            /^\[/ { inentry = ($0 == "[Desktop Entry]"); next }
+            inentry {
+                i = index($0, "="); if (!i) next
+                k = substr($0, 1, i - 1); v = substr($0, i + 1)
+                if (k == "Type") type = v
+                else if (k == "Name") name = v
+                else if (k == "Icon") icon = v
+                else if (k == "Categories") cats = v
+                else if (k == "GenericName") gen = v
+                else if (k == "NoDisplay") nodisplay = v
+                else if (k == "Hidden") hidden = v
+                else if (k == "OnlyShowIn") onlyshow = v
+                else if (k == "NotShowIn") notshow = v
+                else if (k == "Exec" && ex == "") ex = v
+            }
+            END { flush(); if (!n) printf "["; if (extra != "") printf "%s%s", (n ? "," : ""), extra; print "]" }
+        ' extra="$appimg" "${files[@]}" ;;
+    launch) # launch a .desktop file
+        f="$2"; [ -f "$f" ] || exit 1
+        case "$f" in *.[Aa]pp[Ii]mage) chmod +x "$f" 2>/dev/null; (cd "$(dirname "$f")" && setsid "$f" >/dev/null 2>&1 &); exit 0 ;; esac
+        for c in kioclient kioclient6 kioclient5; do command -v $c >/dev/null && { setsid $c exec "$f" >/dev/null 2>&1 & exit 0; }; done
+        command -v gio >/dev/null && { setsid gio launch "$f" >/dev/null 2>&1 & exit 0; }
+        command -v gtk-launch >/dev/null && { setsid gtk-launch "$(basename "$f")" >/dev/null 2>&1 & exit 0; }
+        exit 1 ;;
+    *) echo "usage: poseidonos-stats sys|procs|info|profile|settings|media|allapps|launchers|launch|ctl|exec" ; exit 2 ;;
+esac

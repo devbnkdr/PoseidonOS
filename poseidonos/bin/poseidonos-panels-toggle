@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Flip the taskbar between "always visible" (the default) and "out of the way"
+# (dodge windows, or the last hiding mode you used) - Meta+Shift+B.
+set -uo pipefail
+C="${XDG_CONFIG_HOME:-$HOME/.config}/poseidonos"
+P="$HOME/.local/bin/poseidonos-panels"
+cur=$(sed -n 's/^bottom=//p' "$C/panels" 2>/dev/null | tail -1)
+[ -n "$cur" ] || cur=always
+if [ "$cur" = always ]; then
+    exec "$P" "$(cat "$C/panels-last-bottom" 2>/dev/null || echo dodge)" bottom
+else
+    echo "$cur" > "$C/panels-last-bottom"
+    exec "$P" always bottom
+fi

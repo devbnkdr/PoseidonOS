@@ -1,0 +1,13 @@
+{
+  "KPackageStructure": "Plasma/Wallpaper",
+  "KPlugin": {
+    "Id": "com.poseidonos.wallpaper",
+    "Name": "PoseidonOS Flow Dither",
+    "Description": "Animated Bayer-dithered flow field in the current phosphor colour, with an emblem dithered into the centre",
+    "Icon": "preferences-desktop-wallpaper",
+    "Authors": [{ "Name": "devbnkdr" }],
+    "License": "GPL-3.0-only",
+    "Version": "1.0.0"
+  },
+  "X-Plasma-API-Minimum-Version": "6.0"
+}

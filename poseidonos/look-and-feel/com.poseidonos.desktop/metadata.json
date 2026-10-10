@@ -1,0 +1,13 @@
+{
+  "KPackageStructure": "Plasma/LookAndFeel",
+  "KPlugin": {
+    "Id": "com.poseidonos.desktop",
+    "Name": "PoseidonOS",
+    "Description": "Phosphor CRT terminal desktop with a retro panel layout",
+    "Authors": [{ "Name": "devbnkdr" }],
+    "License": "GPL-3.0-only",
+    "Version": "1.0.0",
+    "Category": ""
+  },
+  "X-Plasma-APIVersion": "2"
+}

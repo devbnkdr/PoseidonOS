@@ -1,0 +1,14 @@
+{
+  "KPackageStructure": "Plasma/Applet",
+  "KPlugin": {
+    "Id": "com.poseidonos.tabs",
+    "Name": "PoseidonOS Tabs",
+    "Description": "Retro terminal tab strip that launches apps (TERMINAL by default); works on a top or bottom bar",
+    "Icon": "utilities-terminal",
+    "Category": "Utilities",
+    "Authors": [{ "Name": "devbnkdr" }],
+    "License": "GPL-3.0-only",
+    "Version": "1.0.0"
+  },
+  "X-Plasma-API-Minimum-Version": "6.0"
+}

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# poseidonos-clock 12|24  - one setting for every clock: saves it to desktop.json
+# (the HUD's CHRONO clock watches that file) and applies it to the taskbar clock.
+case "${1:-}" in 12) V=0; H=False;; 24) V=2; H=True;; *) echo "usage: poseidonos-clock 12|24"; exit 1;; esac
+J="${XDG_CONFIG_HOME:-$HOME/.config}/poseidonos/desktop.json"
+mkdir -p "$(dirname "$J")"
+python3 - "$J" "$H" <<'PY'
+import json, os, sys
+p, h = sys.argv[1], sys.argv[2] == "True"
+try: d = json.load(open(p))
+except Exception: d = {}
+d.setdefault("clock", {})["h24"] = h
+open(p + ".tmp", "w").write(json.dumps(d, indent=1)); os.replace(p + ".tmp", p)
+PY
+# taskbar clock (KDE digitalclock use24hFormat: 0 = 12-hour, 1 = region default, 2 = 24-hour)
+JS='panels().forEach(function(p){ p.widgets("org.kde.plasma.digitalclock").forEach(function(w){ w.currentConfigGroup = ["Appearance"]; w.writeConfig("use24hFormat", '$V'); w.reloadConfig(); }); });'
+dbus-send --session --print-reply --dest=org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript string:"$JS" >/dev/null 2>&1
+echo "clocks set to $1-hour"

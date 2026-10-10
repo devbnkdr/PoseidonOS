@@ -1,0 +1,14 @@
+{
+  "KPlugin": {
+    "Id": "poseidonos",
+    "Name": "PoseidonOS",
+    "Description": "Phosphor CRT terminal Plasma style (follows the active colour scheme)",
+    "Authors": [
+      { "Name": "devbnkdr" }
+    ],
+    "License": "GPL-3.0-only",
+    "Version": "1.0.0",
+    "Website": ""
+  },
+  "X-Plasma-API": "5.0"
+}

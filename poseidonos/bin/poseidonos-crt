@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# poseidonos-crt  start | stop | toggle | restart | status | autostart
+# Click-through CRT overlay (scanlines, vignette, rolling band, flicker).
+#
+# Wayland: one layer-shell surface per screen, on the overlay layer.  That is the
+# only way to get a click-through always-on-top surface that the window manager
+# does not treat as an application window.  Without the layer-shell QML module we
+# refuse to start rather than fall back: the fallback opens ordinary windows,
+# which on Wayland show up as stray empty windows in the taskbar and switcher.
+# X11: an override-redirect window, invisible to the window manager, so the
+# fallback is safe there.
+#
+# The overlay is started fully detached (new session, no controlling tty) so it
+# survives the death of whatever launched it -- plasmashell's "executable"
+# data-engine kills its child shell as soon as the command returns.
+set -u
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}/poseidonos"
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/poseidonos"
+RUND="${XDG_RUNTIME_DIR:-/tmp}"
+PIDF="$RUND/poseidonos-crt.pid"
+LOCK="$RUND/poseidonos-crt.lock"
+LOG="$DATA/poseidonos-crt.log"
+MATCH='poseidonos/crt/overlay-'
+mkdir -p "$CONF" "$DATA"
+
+# defaults, overridable in ~/.config/poseidonos/crt.conf
+SCANLINES=0.14; VIGNETTE=0.55; ROLL=1; FLICKER=1
+[ -f "$CONF/crt.conf" ] && . "$CONF/crt.conf"
+VARIANT=$(cat "$CONF/variant" 2>/dev/null || echo green)
+case "$VARIANT" in amber) TINT="#ffb642";; blue) TINT="#3fc8ff";; *) TINT="#1aff80";; esac
+
+log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" >>"$LOG"; }
+
+find_qml() {
+    for c in qml6 /usr/lib/qt6/bin/qml /usr/lib64/qt6/bin/qml /usr/lib/x86_64-linux-gnu/qt6/bin/qml qml; do
+        local p; p=$(command -v "$c" 2>/dev/null) || continue
+        "$p" --version 2>&1 | grep -q ' 6\.' && { echo "$p"; return 0; }
+    done
+    return 1
+}
+
+on_wayland() { [ "${XDG_SESSION_TYPE:-}" = "wayland" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; }
+
+# is the org.kde.layershell QML module importable?  (Arch: layer-shell-qt)
+layershell_dir() {
+    local d
+    local extra="${QML2_IMPORT_PATH:-}:${QML_IMPORT_PATH:-}"
+    for d in ${extra//:/ } \
+             /usr/lib/qt6/qml /usr/lib/qt/qml /usr/lib64/qt6/qml \
+             /usr/lib/x86_64-linux-gnu/qt6/qml "$HOME/.local/lib/qt6/qml"; do
+        [ -n "$d" ] && [ -d "$d/org/kde/layershell" ] && { echo "$d/org/kde/layershell"; return 0; }
+    done
+    return 1
+}
+
+# a pid is ours only if it is alive AND is actually the overlay (guards against pid reuse)
+alive() {
+    [ -n "${1:-}" ] || return 1
+    kill -0 "$1" 2>/dev/null || return 1
+    tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q "$MATCH"
+}
+
+# echoes the live overlay pid, repairing a stale/missing pid file if the process is up
+current_pid() {
+    local p
+    p=$(cat "$PIDF" 2>/dev/null) || p=""
+    if alive "$p"; then echo "$p"; return 0; fi
+    p=$(pgrep -u "$(id -u)" -f "$MATCH" 2>/dev/null | head -n1)
+    if [ -n "$p" ]; then echo "$p" > "$PIDF"; echo "$p"; return 0; fi
+    rm -f "$PIDF"; return 1
+}
+running() { current_pid >/dev/null 2>&1; }
+
+# kill every overlay process, however it was started
+sweep() { pkill -u "$(id -u)" -f "$MATCH" 2>/dev/null; rm -f "$PIDF"; }
+
+# detached launch: own session, no tty, no inherited fds
+spawn() {
+    setsid nohup "$QML" --apptype gui "$1" "${ARGS[@]}" </dev/null >>"$LOG" 2>&1 &
+    local p=$!
+    sleep 0.2
+    alive "$p" || p=$(pgrep -u "$(id -u)" -f "$(basename "$1")" 2>/dev/null | head -n1)
+    echo "${p:-}"
+}
+
+start() {
+    running && return 0
+    sweep                                   # no leftovers from an earlier attempt
+    local QML; QML=$(find_qml) || { echo "Qt6 'qml' runtime not found (install qt6-declarative)" >&2; log "no qml6 runtime"; return 1; }
+    for f in "$DATA/crt/overlay-wayland.qml" "$DATA/crt/overlay-generic.qml" "$DATA/crt/CrtLayer.qml"; do
+        [ -f "$f" ] || { echo "CRT overlay not installed: $f is missing (run update.sh)" >&2; log "missing $f"; return 1; }
+    done
+    local ARGS=(-- --tint "$TINT" --scanlines "$SCANLINES" --vignette "$VIGNETTE" --roll "$ROLL" --flicker "$FLICKER")
+    : > "$LOG"; log "starting ($VARIANT, scan=$SCANLINES vig=$VIGNETTE roll=$ROLL flicker=$FLICKER)"
+    log "session=${XDG_SESSION_TYPE:-?} wayland_display=${WAYLAND_DISPLAY:-none} qml=$QML"
+    local pid=""
+
+    if on_wayland; then
+        local ls_dir
+        if ls_dir=$(layershell_dir); then
+            log "layer shell qml module dir: $ls_dir"
+            pid=$(spawn "$DATA/crt/overlay-wayland.qml")
+            sleep 1.0
+            # only an actual import failure counts -- not the informational line above
+            if alive "$pid" && ! grep -qiE 'module "org\.kde\.layershell"|org\.kde\.layershell is not installed' "$LOG"; then
+                echo "$pid" > "$PIDF"; log "layer-shell overlay up (pid $pid)"; return 0
+            fi
+            [ -n "$pid" ] && kill "$pid" 2>/dev/null
+            sweep
+            log "layer-shell overlay did not come up"
+            echo "CRT overlay: the layer-shell surface failed - see $LOG" >&2
+        else
+            log "no org.kde.layershell QML module found"
+            echo "CRT overlay needs the layer-shell QML module on Wayland." >&2
+            echo "Install it with:  sudo pacman -S layer-shell-qt" >&2
+        fi
+        # no plain-window fallback here: under Wayland they
+        # become stray empty windows in the taskbar, pager and alt-tab
+        echo "Not starting the plain-window fallback under Wayland (it leaves stray empty windows)." >&2
+        touch "$CONF/crt-off"
+        return 1
+    fi
+
+    # X11: override-redirect, invisible to the window manager
+    pid=$(spawn "$DATA/crt/overlay-generic.qml")
+    sleep 1.0
+    if alive "$pid"; then
+        echo "$pid" > "$PIDF"; log "X11 overlay up (pid $pid)"; return 0
+    fi
+    sweep
+    log "overlay failed to start; last log lines follow"
+    echo "CRT overlay failed to start - see $LOG" >&2
+    tail -n 5 "$LOG" >&2 2>/dev/null
+    return 1
+}
+
+stop() {
+    sweep
+    touch "$CONF/crt-off"
+    log "stopped"
+}
+
+# Turning the overlay off never waits on the lock, so a stuck start cannot block
+# it.  `status` is lock-free too, since the HUD polls it every few seconds.
+case "${1:-toggle}" in
+    status)   running && echo "CRT overlay running (pid $(current_pid))" || echo "CRT overlay stopped"; exit 0 ;;
+    kill)     sweep; echo "CRT overlay processes cleared."; exit 0 ;;
+    stop)     stop; echo "CRT overlay stopped."; exit 0 ;;
+    disable)  sweep; touch "$CONF/crt-off"; log "disabled (will not start at login)"
+              echo "CRT overlay stopped and disabled; it will not come back at login."; exit 0 ;;
+    toggle)   if running; then stop; echo "CRT overlay stopped."; exit 0; fi ;;   # off-path needs no lock
+esac
+
+# only the starting actions serialize, so two clicks cannot race two overlays
+exec 9>"$LOCK"
+if ! flock -w 10 9 2>/dev/null; then
+    echo "CRT overlay: another start is already in progress." >&2
+    exit 0
+fi
+
+case "${1:-toggle}" in
+    start|toggle) rm -f "$CONF/crt-off"; start ;;
+    autostart)    [ -f "$CONF/crt-off" ] || start ;;   # login: respect last toggle state
+    restart)      sweep; rm -f "$CONF/crt-off"; sleep 0.2; start ;;
+    *) echo "usage: poseidonos-crt start|stop|toggle|restart|status|kill|disable"; exit 2 ;;
+esac
